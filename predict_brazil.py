@@ -4,6 +4,8 @@ import warnings
 from collections import defaultdict
 from dotenv import load_dotenv
 import requests
+import json
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -307,7 +309,7 @@ def call_watson(iam_token, winner, second, third, features):
         f"Predictive model picked {winner} as most likely winner, with {second} and {third} next.\n"
         "Explain concisely why the predicted winner would win, using the provided features (wins, podiums, avg_pos, avg_lap_time, lap_var). Then explain why the 2nd and 3rd would not win.\n"
         f"Features snapshot: {features}\n"
-        "Answer in plain text."
+        "Answer in plain readable text with no warning or parantheses or terms and conditions and dont mention model id or name too"
     )
     body = {
         'messages': [{'role': 'user', 'content': prompt}],
@@ -320,6 +322,123 @@ def call_watson(iam_token, winner, second, third, features):
         print('Watson call failed:', r.status_code, r.text[:500])
         return None
     return r.json()
+
+
+#######################
+# Watson response helpers
+#######################
+
+def pretty_print_response(resp):
+    """Print the full Watson response as pretty JSON."""
+    try:
+        print(json.dumps(resp, indent=2, ensure_ascii=False))
+    except Exception:
+        print(resp)
+
+
+def extract_assistant_text(resp):
+    """Extract assistant message text from common Watson/Chat response shapes.
+
+    Handles: resp['choices'][*]['message']['content'], resp['results'][*]['generated_text'],
+    or top-level 'generated_text'. Falls back to stringifying resp.
+    """
+    if not resp:
+        return ""
+
+    # common chat response format with 'choices' list
+    if isinstance(resp, dict) and 'choices' in resp and isinstance(resp['choices'], list):
+        texts = []
+        for choice in resp['choices']:
+            # try nested message -> content
+            msg = choice.get('message') or {}
+            if isinstance(msg, dict):
+                content = msg.get('content') or msg.get('text')
+            else:
+                content = choice.get('text')
+            if content:
+                texts.append(str(content).strip())
+        if texts:
+            return "\n\n".join(texts).strip()
+
+    # results/generate style
+    if isinstance(resp, dict) and 'results' in resp and isinstance(resp['results'], list):
+        first = resp['results'][0]
+        # try common fields
+        for key in ('generated_text', 'text', 'content'):
+            if key in first:
+                return str(first[key]).strip()
+
+    if isinstance(resp, dict) and 'generated_text' in resp:
+        return str(resp['generated_text']).strip()
+
+    # last resort
+    try:
+        return json.dumps(resp, ensure_ascii=False)
+    except Exception:
+        return str(resp)
+
+
+def assistant_text_to_markdown(title, assistant_text):
+    """Return a small Markdown document for the assistant text."""
+    if not assistant_text:
+        return f"## {title}\n\n_No content returned by the assistant._\n"
+    paragraphs = [p.strip() for p in assistant_text.split('\n\n') if p.strip()]
+    md_lines = [f"## {title}", ""]
+    for p in paragraphs:
+        md_lines.append(p)
+        md_lines.append("")
+    return "\n".join(md_lines)
+
+
+def parse_stats_from_text(text):
+    """Heuristic parse of numeric stats from assistant text.
+
+    Returns a dict with any found fields.
+    """
+    stats = {}
+    if not text:
+        return stats
+
+    patterns = {
+        'wins': r"(\d+)\s+wins?",
+        'podiums': r"(\d+)\s+podiums?",
+        'races': r"(\d+)\s+races?",
+        'avg_pos': r"avg(?:erage)?\s+position(?:[:\s]*)?([0-9]+\.[0-9]+|[0-9]+)",
+        'avg_lap_time': r"avg(?:erage)?\s+lap\s+time(?:[:\s]*)?([0-9]+\.[0-9]+|[0-9]+)",
+        'lap_var': r"lap\s+var(?:iance)?(?:[:\s]*)?([0-9]+\.[0-9]+|[0-9]+)"
+    }
+
+    for key, pat in patterns.items():
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            v = m.group(1)
+            try:
+                if '.' in v:
+                    stats[key] = float(v)
+                else:
+                    stats[key] = int(v)
+            except Exception:
+                stats[key] = v
+
+    return stats
+
+
+def save_json(resp, path):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(resp, f, indent=2, ensure_ascii=False)
+        print(f"Saved raw response to {path}")
+    except Exception as e:
+        print(f"Failed to save JSON to {path}: {e}")
+
+
+def save_markdown(md_str, path):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(md_str)
+        print(f"Saved markdown to {path}")
+    except Exception as e:
+        print(f"Failed to save markdown to {path}: {e}")
 
 
 def main():
@@ -346,19 +465,34 @@ def main():
                 second = top.iloc[1]['driver'] if len(top) > 1 else ''
                 third = top.iloc[2]['driver'] if len(top) > 2 else ''
                 resp = call_watson(iam_token, winner, second, third, features)
-                print('\nWatson Analysis:')
-                if resp:
-                    if 'results' in resp and resp['results']:
-                        print(resp['results'][0]['generated_text'])
-                    elif 'generated_text' in resp:
-                        print(resp['generated_text'])
-                    else:
-                        print("Raw response:", resp)
-                else:
-                    print("No response from Watson")
+
+                # Save raw response for auditing
+                save_json(resp, 'watson_raw.json')
+
+                # Extract assistant text and save a Markdown summary
+                assistant_text = extract_assistant_text(resp)
+                md = assistant_text_to_markdown('Watson Analysis', assistant_text)
+                save_markdown(md, 'watson_analysis.md')
+
+                # Try to extract numeric stats heuristically and save
+                stats = parse_stats_from_text(assistant_text)
+                if stats:
+                    save_json(stats, 'watson_stats.json')
+
+                # Print a concise view to console
+                print('\nWatson Analysis (clean):')
+                print(assistant_text)
+                if stats:
+                    print('\nExtracted stats:')
+                    print(stats)
+
             except Exception as e:
-                print(f"Error calling Watson: {e}")
-                print("API Response:", resp if 'resp' in locals() else 'No response')
+                print(f'Error calling Watson: {e}')
+                # attempt to save raw resp if available
+                try:
+                    save_json(resp, 'watson_raw.json')
+                except Exception:
+                    pass
 
 
 if __name__ == '__main__':
